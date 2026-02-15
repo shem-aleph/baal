@@ -695,7 +695,7 @@ class TestErrorHandling:
     
     @pytest.mark.asyncio
     async def test_malformed_json_returns_422(self, unique_device_id):
-        """Malformed JSON returns 422."""
+        """Malformed JSON returns 422 with standardized error format."""
         async with APITestClient() as client:
             await client.login_guest(unique_device_id)
             
@@ -706,10 +706,14 @@ class TestErrorHandling:
                 content="{invalid json content"
             )
             assert response.status_code == 422
+            data = response.json()
+            assert "error" in data
+            assert data["error"]["code"] == "VALIDATION_ERROR"
+            assert data["error"]["status"] == 422
     
     @pytest.mark.asyncio
     async def test_missing_required_fields_returns_422(self, unique_device_id):
-        """Missing required fields returns 422."""
+        """Missing required fields returns 422 with standardized error format."""
         async with APITestClient() as client:
             await client.login_guest(unique_device_id)
             
@@ -719,10 +723,14 @@ class TestErrorHandling:
                 "model": "qwen3-coder-next"
             })
             assert response.status_code == 422
+            data = response.json()
+            assert "error" in data
+            assert data["error"]["code"] == "VALIDATION_ERROR"
+            assert "details" in data["error"]
     
     @pytest.mark.asyncio
     async def test_invalid_model_name_returns_422(self, unique_device_id):
-        """Invalid model name returns 422."""
+        """Invalid model name returns 422 with standardized error format."""
         async with APITestClient() as client:
             await client.login_guest(unique_device_id)
             
@@ -732,6 +740,20 @@ class TestErrorHandling:
                 "model": "nonexistent-model"
             })
             assert response.status_code == 422
+            data = response.json()
+            assert "error" in data
+    
+    @pytest.mark.asyncio
+    async def test_http_error_returns_standardized_format(self, unique_device_id):
+        """HTTP errors (401, 404) use standardized error envelope."""
+        async with APITestClient() as client:
+            # 401 — no auth
+            response = await client.client.get(f"{API_BASE}/agents/")
+            assert response.status_code == 401
+            data = response.json()
+            assert "error" in data
+            assert data["error"]["code"] == "UNAUTHORIZED"
+            assert data["error"]["status"] == 401
 
 
 class TestBulkOperations:
