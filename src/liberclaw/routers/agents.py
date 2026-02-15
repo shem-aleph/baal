@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from baal_core.encryption import decrypt
@@ -38,6 +38,23 @@ from liberclaw.services.usage_tracker import get_agent_count
 router = APIRouter(prefix="/agents", tags=["agents"])
 
 
+@router.get("/pool/stats")
+async def get_pool_stats(
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """Get VM pool statistics. Restricted to pro-tier users."""
+    if user.tier != "pro":
+        raise HTTPException(status_code=403, detail="Admin access required")
+        
+    pool = getattr(request.app.state, "vm_pool", None)
+    if not pool:
+        return {"enabled": False}
+        
+    stats = await pool.get_stats()
+    return {"enabled": True, **stats}
+
+
 @router.get("/", response_model=AgentListResponse)
 async def list_user_agents(
     user: User = Depends(get_current_user),
@@ -51,10 +68,64 @@ async def list_user_agents(
     )
 
 
+def _resolve_agent_config(body: AgentCreate):
+    """Resolve agent configuration from template and request body."""
+    system_prompt = body.system_prompt
+    model = body.model
+    skills = body.skills
+
+    if body.template_id:
+        from baal_core.templates.loader import get_template
+        template = get_template(body.template_id)
+        if not template:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown template: {body.template_id}",
+            )
+        
+        system_prompt = system_prompt or template["system_prompt"]
+        model = model or template["model"]
+        skills = skills or template["skills"]
+
+    if system_prompt is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="system_prompt is required when not using a template",
+        )
+    
+    return system_prompt, model or "qwen3-coder-next", skills
+
+
+def _validate_skills(skills):
+    """Validate skills list if provided."""
+    if not skills:
+        return
+        
+    from baal_core.templates.loader import validate_skills
+    invalid = validate_skills(skills)
+    if invalid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown skills: {', '.join(invalid)}",
+        )
+
+
+def _create_deployer(settings):
+    """Create AlephDeployer instance from settings."""
+    from baal_core.deployer import AlephDeployer
+    
+    return AlephDeployer(
+        private_key=settings.aleph_private_key,
+        ssh_pubkey=settings.aleph_ssh_pubkey,
+        ssh_privkey_path=settings.aleph_ssh_privkey_path,
+    )
+
+
 @router.post("/", response_model=AgentResponse, status_code=201)
 async def create_user_agent(
     body: AgentCreate,
     background_tasks: BackgroundTasks,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -70,45 +141,11 @@ async def create_user_agent(
             detail=f"Agent limit reached ({agent_limit})",
         )
 
-    # Resolve template defaults
-    system_prompt = body.system_prompt
-    model = body.model
-    skills = body.skills
+    # Resolve configuration from template and request
+    system_prompt, model, skills = _resolve_agent_config(body)
+    _validate_skills(skills)
 
-    if body.template_id:
-        from baal_core.templates.loader import get_template, validate_skills
-        template = get_template(body.template_id)
-        if not template:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown template: {body.template_id}",
-            )
-        if system_prompt is None:
-            system_prompt = template["system_prompt"]
-        if model is None:
-            model = template["model"]
-        if skills is None:
-            skills = template["skills"]
-
-    # Final defaults
-    if system_prompt is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="system_prompt is required when not using a template",
-        )
-    if model is None:
-        model = "qwen3-coder-next"
-
-    # Validate skills
-    if skills:
-        from baal_core.templates.loader import validate_skills
-        invalid = validate_skills(skills)
-        if invalid:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown skills: {', '.join(invalid)}",
-            )
-
+    # Create agent and emit activity
     agent = await create_agent(
         db, user.id, body.name, system_prompt, model,
         settings.encryption_key, skills=skills,
@@ -121,13 +158,8 @@ async def create_user_agent(
     await db.commit()
 
     # Launch background deployment
-    from baal_core.deployer import AlephDeployer
-
-    deployer = AlephDeployer(
-        private_key=settings.aleph_private_key,
-        ssh_pubkey=settings.aleph_ssh_pubkey,
-        ssh_privkey_path=settings.aleph_ssh_privkey_path,
-    )
+    deployer = _create_deployer(settings)
+    vm_pool = getattr(request.app.state, "vm_pool", None)
     background_tasks.add_task(
         deploy_agent_background,
         agent_id=agent.id,
@@ -135,6 +167,7 @@ async def create_user_agent(
         libertai_api_key=settings.libertai_api_key,
         encryption_key=settings.encryption_key,
         db_factory=get_session_factory(),
+        vm_pool=vm_pool,
     )
 
     return AgentResponse.model_validate(agent)
@@ -165,15 +198,7 @@ async def update_user_agent(
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
 
-    # Validate skills if provided
-    if body.skills is not None:
-        from baal_core.templates.loader import validate_skills
-        invalid = validate_skills(body.skills)
-        if invalid:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown skills: {', '.join(invalid)}",
-            )
+    _validate_skills(body.skills)
 
     try:
         agent = await update_agent(
@@ -184,7 +209,11 @@ async def update_user_agent(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    changes = [k for k in ("name", "system_prompt", "model", "skills") if getattr(body, k) is not None]
+    changes = [
+        field for field in ("name", "system_prompt", "model", "skills") 
+        if getattr(body, field) is not None
+    ]
+    
     if changes:
         await emit_activity(
             db, "agent_updated",
@@ -198,6 +227,7 @@ async def update_user_agent(
 @router.delete("/{agent_id}", status_code=204)
 async def delete_user_agent(
     agent_id: uuid.UUID,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -207,13 +237,9 @@ async def delete_user_agent(
         raise HTTPException(status_code=404, detail="Agent not found")
 
     settings = get_settings()
-    from baal_core.deployer import AlephDeployer
-
-    deployer = AlephDeployer(
-        private_key=settings.aleph_private_key,
-        ssh_pubkey=settings.aleph_ssh_pubkey,
-        ssh_privkey_path=settings.aleph_ssh_privkey_path,
-    )
+    deployer = _create_deployer(settings)
+    vm_pool = getattr(request.app.state, "vm_pool", None)
+    
     agent_name = agent.name
     await emit_activity(
         db, "agent_deleted",
@@ -221,7 +247,8 @@ async def delete_user_agent(
         metadata={"agent_name": agent_name},
         is_public=True,
     )
-    await delete_agent(db, agent, deployer)
+    
+    await delete_agent(db, agent, deployer, vm_pool=vm_pool)
 
 
 @router.get("/{agent_id}/health", response_model=AgentHealthResponse)
@@ -292,10 +319,26 @@ async def get_deployment_status(
     )
 
 
+async def _cleanup_existing_vm(agent, deployer):
+    """Clean up existing VM instance if it exists."""
+    if not agent.instance_hash:
+        return
+        
+    try:
+        await deployer.destroy_instance(agent.instance_hash)
+    except Exception:
+        pass  # Best-effort cleanup; new deploy will proceed regardless
+        
+    agent.instance_hash = None
+    agent.crn_url = None
+    agent.vm_url = None
+
+
 @router.post("/{agent_id}/rebuild", response_model=AgentResponse)
 async def rebuild_agent(
     agent_id: uuid.UUID,
     background_tasks: BackgroundTasks,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -305,26 +348,16 @@ async def rebuild_agent(
         raise HTTPException(status_code=404, detail="Agent not found")
 
     if agent.deployment_status not in ("failed", "pending", "running", "deploying"):
-        raise HTTPException(status_code=400, detail="Agent cannot be rebuilt in its current state")
+        raise HTTPException(
+            status_code=400, 
+            detail="Agent cannot be rebuilt in its current state"
+        )
 
     settings = get_settings()
-    from baal_core.deployer import AlephDeployer
-
-    deployer = AlephDeployer(
-        private_key=settings.aleph_private_key,
-        ssh_pubkey=settings.aleph_ssh_pubkey,
-        ssh_privkey_path=settings.aleph_ssh_privkey_path,
-    )
+    deployer = _create_deployer(settings)
 
     # Destroy old VM first to avoid orphaned instances
-    if agent.instance_hash:
-        try:
-            await deployer.destroy_instance(agent.instance_hash)
-        except Exception:
-            pass  # Best-effort cleanup; new deploy will proceed regardless
-        agent.instance_hash = None
-        agent.crn_url = None
-        agent.vm_url = None
+    await _cleanup_existing_vm(agent, deployer)
 
     await emit_activity(
         db, "agent_rebuilt",
@@ -332,9 +365,11 @@ async def rebuild_agent(
         metadata={"agent_name": agent.name},
         is_public=True,
     )
+    
     agent.deployment_status = "pending"
     await db.commit()
 
+    vm_pool = getattr(request.app.state, "vm_pool", None)
     background_tasks.add_task(
         deploy_agent_background,
         agent_id=agent.id,
@@ -342,6 +377,7 @@ async def rebuild_agent(
         libertai_api_key=settings.libertai_api_key,
         encryption_key=settings.encryption_key,
         db_factory=get_session_factory(),
+        vm_pool=vm_pool,
     )
 
     return AgentResponse.model_validate(agent)
@@ -360,19 +396,17 @@ async def redeploy_agent(
         raise HTTPException(status_code=404, detail="Agent not found")
 
     if agent.deployment_status not in ("running", "failed"):
-        raise HTTPException(status_code=400, detail="Agent is not in a redeployable state")
+        raise HTTPException(
+            status_code=400, 
+            detail="Agent is not in a redeployable state"
+        )
 
     agent.deployment_status = "deploying"
     await db.commit()
 
     settings = get_settings()
-    from baal_core.deployer import AlephDeployer
-
-    deployer = AlephDeployer(
-        private_key=settings.aleph_private_key,
-        ssh_pubkey=settings.aleph_ssh_pubkey,
-        ssh_privkey_path=settings.aleph_ssh_privkey_path,
-    )
+    deployer = _create_deployer(settings)
+    
     background_tasks.add_task(
         redeploy_agent_background,
         agent_id=agent.id,

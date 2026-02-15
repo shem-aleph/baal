@@ -21,6 +21,16 @@ from liberclaw.services.activity import emit_activity
 logger = logging.getLogger(__name__)
 
 
+async def _check_agent_health(health_check, vm_url, max_attempts=12, delay=10):
+    """Check agent health with retries."""
+    for attempt in range(max_attempts):
+        await asyncio.sleep(delay)
+        healthy = await health_check(vm_url)
+        if healthy:
+            return True
+    return False
+
+
 async def create_agent(
     db: AsyncSession,
     owner_id: uuid.UUID,
@@ -96,15 +106,294 @@ async def update_agent(
 
 
 async def delete_agent(
-    db: AsyncSession, agent: Agent, deployer: AlephDeployer
+    db: AsyncSession, agent: Agent, deployer: AlephDeployer, vm_pool=None
 ) -> None:
     """Delete an agent and destroy its VM."""
-    if agent.instance_hash:
+    if not agent.instance_hash:
+        await db.delete(agent)
+        return
+
+    # Clean up pool entry if this VM came from the pool
+    if vm_pool:
         try:
-            await deployer.destroy_instance(agent.instance_hash)
+            await vm_pool.remove_by_instance(agent.instance_hash)
         except Exception as e:
-            logger.error(f"Failed to destroy VM for agent {agent.id}: {e}")
+            logger.warning(f"Pool cleanup failed for {agent.instance_hash}: {e}")
+    
+    # Destroy the VM
+    try:
+        await deployer.destroy_instance(agent.instance_hash)
+    except Exception as e:
+        logger.error(f"Failed to destroy VM for agent {agent.id}: {e}")
+    
     await db.delete(agent)
+
+
+async def _setup_pool_vm(agent_id, agent, pooled_vm, db, set_step, add_log):
+    """Set up agent record with pooled VM details."""
+    add_log(agent_id, "info", "Claimed pre-provisioned VM from pool")
+    set_step(agent_id, "provisioning", "done",
+             f"VM claimed from pool ({pooled_vm.instance_hash[:12]}...)")
+    set_step(agent_id, "allocation", "done",
+             f"VM already online at {pooled_vm.vm_ip}:{pooled_vm.ssh_port}")
+
+    agent.instance_hash = pooled_vm.instance_hash
+    agent.crn_url = pooled_vm.crn_url
+    await db.commit()
+
+
+async def _deploy_to_pooled_vm(
+    pooled_vm, agent, deployer, libertai_api_key, agent_secret, subdomain
+):
+    """Deploy agent code to the pooled VM."""
+    agent_skills = json.loads(agent.skills) if agent.skills else None
+    fqdn = f"{subdomain}.2n6.me"
+
+    return await deployer.deploy_agent_code(
+        vm_ip=pooled_vm.vm_ip,
+        ssh_port=pooled_vm.ssh_port,
+        fqdn=fqdn,
+        agent_name=agent.name,
+        system_prompt=agent.system_prompt,
+        model=agent.model,
+        libertai_api_key=libertai_api_key,
+        agent_secret=agent_secret,
+        owner_chat_id=str(agent.owner_id),
+        skills=agent_skills,
+    )
+
+
+async def _finalize_pool_deployment(
+    agent_id, agent, pooled_vm, vm_pool, vm_url, healthy, duration, db
+):
+    """Finalize pool deployment with appropriate status."""
+    if healthy:
+        agent.vm_url = vm_url
+        agent.deployment_status = "running"
+        await vm_pool.mark_deployed(pooled_vm.id, agent.id)
+        
+        db.add(DeploymentHistory(
+            agent_id=agent_id, status="success",
+            step="pool_complete", duration_seconds=duration,
+        ))
+        
+        await emit_activity(
+            db, "agent_deployed",
+            user_id=agent.owner_id, agent_id=agent.id,
+            metadata={
+                "agent_name": agent.name, "crn_url": agent.crn_url,
+                "model": agent.model, "pool": True
+            },
+            is_public=True,
+        )
+    else:
+        agent.vm_url = vm_url
+        agent.deployment_status = "failed"
+        await vm_pool.mark_deployed(pooled_vm.id, agent.id)
+        
+        db.add(DeploymentHistory(
+            agent_id=agent_id, status="failed",
+            step="health_check",
+            error_message="Agent not responding after 30s (pool)",
+            duration_seconds=duration,
+        ))
+
+    await db.commit()
+
+
+async def _try_pool_deploy(
+    agent_id: uuid.UUID,
+    agent,
+    pooled_vm,
+    vm_pool,
+    deployer: AlephDeployer,
+    libertai_api_key: str,
+    agent_secret: str,
+    deploy_start: float,
+    db,
+    set_step,
+    add_log,
+    health_check,
+) -> bool:
+    """Attempt to deploy an agent using a pooled VM.
+
+    Returns True if deployment completed (success or health-check failure).
+    Returns False if we should fall back to cold provisioning.
+    """
+    await _setup_pool_vm(agent_id, agent, pooled_vm, db, set_step, add_log)
+
+    # Look up subdomain
+    subdomain = await deployer.lookup_subdomain(pooled_vm.instance_hash)
+    if not subdomain:
+        add_log(agent_id, "error", "Could not resolve subdomain for pooled VM")
+        await vm_pool.release(pooled_vm.id)
+        return False
+
+    # Deploy code to the warm VM
+    set_step(agent_id, "environment", "active",
+             "Deploying agent code to pre-provisioned VM...")
+    add_log(agent_id, "info", "Deploying code (fast path)...")
+
+    deploy_result = await _deploy_to_pooled_vm(
+        pooled_vm, agent, deployer, libertai_api_key, agent_secret, subdomain
+    )
+
+    if deploy_result.get("status") != "success":
+        error = deploy_result.get("error", "Unknown error")
+        add_log(agent_id, "error", f"Pool deploy failed: {error}")
+        await vm_pool.release(pooled_vm.id)
+        return False
+
+    vm_url = deploy_result["vm_url"]
+    set_step(agent_id, "environment", "done", "Code deployed")
+    set_step(agent_id, "service", "done", f"HTTPS active at {subdomain}.2n6.me")
+
+    # Health check
+    set_step(agent_id, "health", "active", "Verifying agent is responding...")
+    add_log(agent_id, "info", f"Checking health at {vm_url}/health...")
+
+    healthy = await _check_agent_health(health_check, vm_url, max_attempts=6, delay=5)
+    duration = int(time.monotonic() - deploy_start)
+
+    if healthy:
+        set_step(agent_id, "health", "done", f"Agent responding on {vm_url}")
+        add_log(agent_id, "success", f"Pool deployment complete in {duration}s.")
+    else:
+        set_step(agent_id, "health", "failed", "Agent not responding after pool deploy")
+        add_log(agent_id, "error", "Health check failed — agent deployed but not responding.")
+
+    await _finalize_pool_deployment(
+        agent_id, agent, pooled_vm, vm_pool, vm_url, healthy, duration, db
+    )
+    
+    return True
+
+
+async def _create_vm_instance(agent_id, agent, deployer, set_step, add_log, db):
+    """Create VM instance on Aleph Cloud. Returns (instance_hash, crn_url) or (None, None) on failure."""
+    set_step(agent_id, "provisioning", "active")
+    add_log(agent_id, "info", "Discovering compute nodes...")
+
+    create_result = await deployer.create_instance(agent.name)
+
+    if create_result.get("status") != "success":
+        error = create_result.get("error", "Unknown error")
+        set_step(agent_id, "provisioning", "failed", error)
+        add_log(agent_id, "error", f"Provisioning failed: {error}")
+        agent.deployment_status = "failed"
+        db.add(DeploymentHistory(
+            agent_id=agent_id, status="failed",
+            step="create_instance", error_message=error,
+        ))
+        await db.commit()
+        return None, None
+
+    instance_hash = create_result["instance_hash"]
+    crn_url = create_result["crn_url"]
+    agent.instance_hash = instance_hash
+    agent.crn_url = crn_url
+    await db.commit()
+
+    set_step(agent_id, "provisioning", "done",
+             f"VM created (instance: {instance_hash[:12]}...)")
+    add_log(agent_id, "success",
+            f"Instance {instance_hash[:12]}... created on CRN")
+    
+    return instance_hash, crn_url
+
+
+async def _wait_for_vm_allocation(agent_id, instance_hash, crn_url, deployer, set_step, add_log, db):
+    """Wait for VM allocation. Returns (vm_ip, ssh_port) or (None, None) on failure."""
+    set_step(agent_id, "allocation", "active", "Waiting for VM to come online...")
+    add_log(agent_id, "info", "Polling for VM allocation...")
+
+    alloc = await deployer.wait_for_allocation(instance_hash, crn_url)
+
+    if not alloc:
+        set_step(agent_id, "allocation", "failed", "Allocation timed out after 120s")
+        add_log(agent_id, "error", "VM allocation timed out")
+        db.add(DeploymentHistory(
+            agent_id=agent_id, status="failed",
+            step="wait_allocation", error_message="Allocation timed out",
+        ))
+        await db.commit()
+        return None, None
+
+    vm_ip = alloc["vm_ipv4"]
+    ssh_port = alloc.get("ssh_port", 22)
+
+    set_step(agent_id, "allocation", "done", f"VM online at {vm_ip}:{ssh_port}")
+    add_log(agent_id, "success", f"VM allocated: {vm_ip}:{ssh_port}")
+    
+    return vm_ip, ssh_port
+
+
+async def _finalize_deployment(agent_id, agent, vm_url, healthy, duration, db, set_step, add_log):
+    """Finalize deployment with appropriate status and history."""
+    agent.vm_url = vm_url
+    
+    if healthy:
+        set_step(agent_id, "health", "done", f"Agent responding on {vm_url}")
+        add_log(agent_id, "success", f"Health check passed. Deployment complete in {duration}s.")
+        agent.deployment_status = "running"
+        
+        db.add(DeploymentHistory(
+            agent_id=agent_id, status="success",
+            step="complete", duration_seconds=duration,
+        ))
+        await emit_activity(
+            db, "agent_deployed",
+            user_id=agent.owner_id, agent_id=agent.id,
+            metadata={
+                "agent_name": agent.name, 
+                "crn_url": agent.crn_url, 
+                "model": agent.model
+            },
+            is_public=True,
+        )
+    else:
+        set_step(agent_id, "health", "failed", "Agent is not responding after deployment")
+        add_log(agent_id, "error", "Health check failed — agent deployed but not responding. Use Rebuild to retry.")
+        agent.deployment_status = "failed"
+        
+        db.add(DeploymentHistory(
+            agent_id=agent_id, status="failed",
+            step="health_check", error_message="Agent not responding after 120s",
+            duration_seconds=duration,
+        ))
+
+    await db.commit()
+
+
+async def _finalize_redeploy(agent_id, agent, healthy, duration, db, set_step, add_log):
+    """Finalize redeploy with appropriate status."""
+    if healthy:
+        set_step(agent_id, "health", "done", f"Agent responding on {agent.vm_url}")
+        add_log(agent_id, "success", f"Redeploy complete in {duration}s.")
+        agent.deployment_status = "running"
+        
+        db.add(DeploymentHistory(
+            agent_id=agent_id, status="success",
+            step="redeploy_complete", duration_seconds=duration,
+        ))
+        await emit_activity(
+            db, "agent_redeployed",
+            user_id=agent.owner_id, agent_id=agent.id,
+            metadata={"agent_name": agent.name},
+            is_public=True,
+        )
+    else:
+        set_step(agent_id, "health", "failed", "Agent not responding after redeploy")
+        add_log(agent_id, "error", "Health check failed after redeploy. Use Rebuild to retry.")
+        agent.deployment_status = "failed"
+        
+        db.add(DeploymentHistory(
+            agent_id=agent_id, status="failed",
+            step="health_check", error_message="Agent not responding after redeploy",
+            duration_seconds=duration,
+        ))
+
+    await db.commit()
 
 
 async def deploy_agent_background(
@@ -113,6 +402,7 @@ async def deploy_agent_background(
     libertai_api_key: str,
     encryption_key: str,
     db_factory,
+    vm_pool=None,
 ) -> None:
     """Background task: deploy an agent to Aleph Cloud.
 
@@ -149,65 +439,44 @@ async def deploy_agent_background(
         agent.deployment_status = "deploying"
         await db.commit()
 
+        pooled_vm = None
         try:
             agent_secret = decrypt(agent.auth_token, encryption_key)
 
-            # ── Step 1: Infrastructure Provisioning ────────────────────
-            set_step(agent_id, "provisioning", "active")
-            add_log(agent_id, "info", "Discovering compute nodes...")
+            # ── Fast path: claim a pre-provisioned VM from the pool ────
+            pooled_vm = await vm_pool.claim() if vm_pool else None
 
-            create_result = await deployer.create_instance(agent.name)
+            if pooled_vm:
+                pool_success = await _try_pool_deploy(
+                    agent_id, agent, pooled_vm, vm_pool, deployer,
+                    libertai_api_key, agent_secret, deploy_start,
+                    db, set_step, add_log, health_check,
+                )
+                if pool_success:
+                    return  # Done — pool fast path complete
 
-            if create_result.get("status") != "success":
-                error = create_result.get("error", "Unknown error")
-                set_step(agent_id, "provisioning", "failed", error)
-                add_log(agent_id, "error", f"Provisioning failed: {error}")
-                agent.deployment_status = "failed"
-                db.add(DeploymentHistory(
-                    agent_id=agent_id, status="failed",
-                    step="create_instance", error_message=error,
-                ))
+                # Pool deploy failed — reset state for cold path
+                agent.instance_hash = None
+                agent.crn_url = None
                 await db.commit()
+                set_step(agent_id, "provisioning", "pending")
+                set_step(agent_id, "allocation", "pending")
+                add_log(agent_id, "info", "Falling back to cold provisioning...")
+
+            # ── Step 1: Infrastructure Provisioning (cold path) ────────
+            instance_hash, crn_url = await _create_vm_instance(
+                agent_id, agent, deployer, set_step, add_log, db
+            )
+            if not instance_hash:
                 return
-
-            instance_hash = create_result["instance_hash"]
-            crn_url = create_result["crn_url"]
-            agent.instance_hash = instance_hash
-            agent.crn_url = crn_url
-            await db.commit()
-
-            set_step(agent_id, "provisioning", "done",
-                     f"VM created (instance: {instance_hash[:12]}...)")
-            add_log(agent_id, "success",
-                    f"Instance {instance_hash[:12]}... created on CRN")
 
             # ── Step 2: Network Allocation ─────────────────────────────
-            set_step(agent_id, "allocation", "active",
-                     "Waiting for VM to come online...")
-            add_log(agent_id, "info", "Polling for VM allocation...")
-
-            alloc = await deployer.wait_for_allocation(instance_hash, crn_url)
-
-            if not alloc:
-                set_step(agent_id, "allocation", "failed",
-                         "Allocation timed out after 120s")
-                add_log(agent_id, "error", "VM allocation timed out")
+            vm_ip, ssh_port = await _wait_for_vm_allocation(
+                agent_id, instance_hash, crn_url, deployer, set_step, add_log, db
+            )
+            if not vm_ip:
                 agent.deployment_status = "failed"
-                db.add(DeploymentHistory(
-                    agent_id=agent_id, status="failed",
-                    step="wait_allocation",
-                    error_message="Allocation timed out",
-                ))
-                await db.commit()
                 return
-
-            vm_ip = alloc["vm_ipv4"]
-            ssh_port = alloc.get("ssh_port", 22)
-
-            set_step(agent_id, "allocation", "done",
-                     f"VM online at {vm_ip}:{ssh_port}")
-            add_log(agent_id, "success",
-                    f"VM allocated: {vm_ip}:{ssh_port}")
 
             # ── Steps 3-5: Deploy agent (SSH → environment → service) ──
             # The deployer calls on_deploy_progress for sub-step updates
@@ -246,56 +515,15 @@ async def deploy_agent_background(
             vm_url = deploy_result["vm_url"]
 
             # ── Step 6: Health Check ───────────────────────────────────
-            set_step(agent_id, "health", "active",
-                     "Verifying agent is responding...")
+            set_step(agent_id, "health", "active", "Verifying agent is responding...")
             add_log(agent_id, "info", f"Checking health at {vm_url}/health...")
 
-            # Give the agent time to start + Caddy time to obtain TLS cert
-            healthy = False
-            for attempt in range(12):  # 12 attempts × 10s = 120s max
-                await asyncio.sleep(10)
-                healthy = await health_check(vm_url)
-                if healthy:
-                    break
-                if attempt < 11:
-                    add_log(agent_id, "info",
-                            f"Waiting for agent startup ({(attempt + 1) * 10}s)...")
-
+            healthy = await _check_agent_health(health_check, vm_url)
             duration = int(time.monotonic() - deploy_start)
 
-            if healthy:
-                set_step(agent_id, "health", "done",
-                         f"Agent responding on {vm_url}")
-                add_log(agent_id, "success",
-                        f"Health check passed. Deployment complete in {duration}s.")
-                agent.vm_url = vm_url
-                agent.deployment_status = "running"
-                db.add(DeploymentHistory(
-                    agent_id=agent_id, status="success",
-                    step="complete", duration_seconds=duration,
-                ))
-                await emit_activity(
-                    db, "agent_deployed",
-                    user_id=agent.owner_id,
-                    agent_id=agent.id,
-                    metadata={"agent_name": agent.name, "crn_url": agent.crn_url, "model": agent.model},
-                    is_public=True,
-                )
-            else:
-                set_step(agent_id, "health", "failed",
-                         "Agent is not responding after deployment")
-                add_log(agent_id, "error",
-                        "Health check failed — agent deployed but not responding. Use Rebuild to retry.")
-                agent.vm_url = vm_url
-                agent.deployment_status = "failed"
-                db.add(DeploymentHistory(
-                    agent_id=agent_id, status="failed",
-                    step="health_check",
-                    error_message="Agent not responding after 120s",
-                    duration_seconds=duration,
-                ))
-
-            await db.commit()
+            await _finalize_deployment(
+                agent_id, agent, vm_url, healthy, duration, db, set_step, add_log
+            )
 
         except Exception as e:
             logger.error(f"Deployment failed for agent {agent_id}: {e}", exc_info=True)
@@ -426,53 +654,13 @@ async def redeploy_agent_background(
             add_log(agent_id, "success", "Code and configuration pushed")
 
             # ── Step 3: Health Check ─────────────────────────────────────
-            set_step(agent_id, "health", "active",
-                     "Verifying agent is responding...")
+            set_step(agent_id, "health", "active", "Verifying agent is responding...")
             add_log(agent_id, "info", f"Checking health at {agent.vm_url}/health...")
 
-            healthy = False
-            for attempt in range(6):  # 6 × 5s = 30s (faster — VM is already up)
-                await asyncio.sleep(5)
-                healthy = await health_check(agent.vm_url)
-                if healthy:
-                    break
-                if attempt < 5:
-                    add_log(agent_id, "info",
-                            f"Waiting for restart ({(attempt + 1) * 5}s)...")
-
+            healthy = await _check_agent_health(health_check, agent.vm_url, max_attempts=6, delay=5)
             duration = int(time.monotonic() - deploy_start)
 
-            if healthy:
-                set_step(agent_id, "health", "done",
-                         f"Agent responding on {agent.vm_url}")
-                add_log(agent_id, "success",
-                        f"Redeploy complete in {duration}s.")
-                agent.deployment_status = "running"
-                db.add(DeploymentHistory(
-                    agent_id=agent_id, status="success",
-                    step="redeploy_complete", duration_seconds=duration,
-                ))
-                await emit_activity(
-                    db, "agent_redeployed",
-                    user_id=agent.owner_id,
-                    agent_id=agent.id,
-                    metadata={"agent_name": agent.name},
-                    is_public=True,
-                )
-            else:
-                set_step(agent_id, "health", "failed",
-                         "Agent not responding after redeploy")
-                add_log(agent_id, "error",
-                        "Health check failed after redeploy. Use Rebuild to retry.")
-                agent.deployment_status = "failed"
-                db.add(DeploymentHistory(
-                    agent_id=agent_id, status="failed",
-                    step="health_check",
-                    error_message="Agent not responding after redeploy",
-                    duration_seconds=duration,
-                ))
-
-            await db.commit()
+            await _finalize_redeploy(agent_id, agent, healthy, duration, db, set_step, add_log)
 
         except Exception as e:
             logger.error(f"Redeploy failed for agent {agent_id}: {e}", exc_info=True)

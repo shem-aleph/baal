@@ -71,11 +71,8 @@ class VMPool:
         self._replenish_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
-    async def initialize(self) -> None:
-        """Initialize database and create tables."""
-        self._db = await aiosqlite.connect(self.db_path)
-        self._db.row_factory = aiosqlite.Row
-
+    async def _create_database_schema(self):
+        """Create database tables and indexes."""
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS vm_pool (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,22 +88,35 @@ class VMPool:
                 -- status: 'provisioning', 'warm', 'claimed', 'deployed', 'failed'
             )
         """)
+        
         # Partial unique index: only enforce uniqueness for non-placeholder hashes
         await self._db.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_hash 
             ON vm_pool(instance_hash) WHERE instance_hash != 'pending'
         """)
         await self._db.commit()
+
+    async def _cleanup_stale_entries(self):
+        """Clean up stale entries from previous runs."""
         # Recover from unclean shutdown: release any orphaned 'claimed' VMs
         await self._db.execute("""
             UPDATE vm_pool SET status = 'warm', claimed_at = NULL, agent_id = NULL
             WHERE status = 'claimed'
         """)
+        
         # Clean up any stuck 'provisioning' entries from previous run
         await self._db.execute("""
             DELETE FROM vm_pool WHERE status = 'provisioning'
         """)
         await self._db.commit()
+
+    async def initialize(self) -> None:
+        """Initialize database and create tables."""
+        self._db = await aiosqlite.connect(self.db_path)
+        self._db.row_factory = aiosqlite.Row
+
+        await self._create_database_schema()
+        await self._cleanup_stale_entries()
 
         logger.info(f"VM pool initialized (min={self.min_size}, max={self.max_size})")
 
@@ -138,8 +148,13 @@ class VMPool:
     # ── Claim / release ───────────────────────────────────────────────
 
     async def claim(self) -> PooledVM | None:
-        """Claim a warm VM from the pool. Returns None if pool is empty."""
+        """Claim a warm VM from the pool. Returns None if pool is empty.
+
+        Uses asyncio lock + atomic update to prevent race conditions
+        between concurrent claim requests.
+        """
         async with self._lock:
+            # Find oldest warm VM
             async with self._db.execute("""
                 SELECT * FROM vm_pool
                 WHERE status = 'warm'
@@ -152,13 +167,18 @@ class VMPool:
                 logger.warning("Pool empty — no warm VMs available")
                 return None
 
+            # Atomic claim: only update if still warm (guards against edge cases)
             now = datetime.now(timezone.utc).isoformat()
-            await self._db.execute("""
+            cursor = await self._db.execute("""
                 UPDATE vm_pool
                 SET status = 'claimed', claimed_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'warm'
             """, (now, row["id"]))
             await self._db.commit()
+
+            if cursor.rowcount == 0:
+                logger.warning(f"VM {row['id']} was claimed by another request, retrying")
+                return None
 
             logger.info(f"Claimed VM {row['instance_hash'][:12]}... from pool")
 
@@ -178,7 +198,7 @@ class VMPool:
         await self._db.execute("""
             UPDATE vm_pool
             SET status = 'deployed', agent_id = ?
-            WHERE id = ?
+            WHERE id = ? AND status = 'claimed'
         """, (agent_id, pool_id))
         await self._db.commit()
         logger.info(f"Pool VM {pool_id} deployed for agent {agent_id}")
@@ -269,17 +289,42 @@ class VMPool:
             if isinstance(r, Exception):
                 logger.error(f"Provision failed: {r}")
 
-    async def _provision_one(self) -> None:
-        """Provision a single VM and add to pool."""
+    async def _create_pool_placeholder(self):
+        """Create a placeholder entry for a new pool VM."""
         now = datetime.now(timezone.utc).isoformat()
-
-        # Insert placeholder
         async with self._db.execute("""
             INSERT INTO vm_pool (instance_hash, vm_ip, vm_url, crn_url, ssh_port, created_at, status)
             VALUES ('pending', '', '', '', 22, ?, 'provisioning')
         """, (now,)) as cursor:
             pool_id = cursor.lastrowid
         await self._db.commit()
+        return pool_id
+
+    async def _mark_provision_failed(self, pool_id):
+        """Mark pool entry as failed."""
+        await self._db.execute(
+            "UPDATE vm_pool SET status = 'failed' WHERE id = ?",
+            (pool_id,),
+        )
+        await self._db.commit()
+
+    async def _complete_vm_provision(self, pool_id, instance_hash, vm_ip, vm_url, crn_url, ssh_port):
+        """Update pool entry with completed VM details."""
+        await self._db.execute("""
+            UPDATE vm_pool SET
+                instance_hash = ?,
+                vm_ip = ?,
+                vm_url = ?,
+                crn_url = ?,
+                ssh_port = ?,
+                status = 'warm'
+            WHERE id = ?
+        """, (instance_hash, vm_ip, vm_url, crn_url, ssh_port, pool_id))
+        await self._db.commit()
+
+    async def _provision_one(self) -> None:
+        """Provision a single VM and add to pool."""
+        pool_id = await self._create_pool_placeholder()
 
         try:
             # Create VM via Aleph
@@ -293,7 +338,6 @@ class VMPool:
 
             # Wait for allocation
             alloc = await self.deployer.wait_for_allocation(instance_hash, crn_url)
-
             if not alloc:
                 raise RuntimeError("Allocation timed out")
 
@@ -302,58 +346,43 @@ class VMPool:
 
             # Look up 2n6.me URL
             subdomain = await self.deployer.lookup_subdomain(instance_hash)
-            vm_url = f"https://{subdomain}.2n6.me" if subdomain else ""
-
             if not subdomain:
                 raise RuntimeError("Could not resolve 2n6.me subdomain")
+
+            vm_url = f"https://{subdomain}.2n6.me"
 
             # Pre-install dependencies so deploy_agent_code() is fast
             prep_result = await self.deployer.prepare_vm(vm_ip, ssh_port)
             if prep_result.get("status") != "success":
-                raise RuntimeError(
-                    f"prepare_vm failed: {prep_result.get('error', 'unknown')}"
-                )
+                raise RuntimeError(f"prepare_vm failed: {prep_result.get('error', 'unknown')}")
 
             # Update pool entry — only mark 'warm' after deps are installed
-            await self._db.execute("""
-                UPDATE vm_pool SET
-                    instance_hash = ?,
-                    vm_ip = ?,
-                    vm_url = ?,
-                    crn_url = ?,
-                    ssh_port = ?,
-                    status = 'warm'
-                WHERE id = ?
-            """, (instance_hash, vm_ip, vm_url, crn_url, ssh_port, pool_id))
-            await self._db.commit()
+            await self._complete_vm_provision(pool_id, instance_hash, vm_ip, vm_url, crn_url, ssh_port)
 
             logger.info(f"Provisioned pool VM: {instance_hash[:12]}... at {vm_ip} (deps installed)")
 
         except Exception as e:
             logger.error(f"Failed to provision pool VM: {e}")
-            await self._db.execute(
-                "UPDATE vm_pool SET status = 'failed' WHERE id = ?",
-                (pool_id,),
-            )
-            await self._db.commit()
+            await self._mark_provision_failed(pool_id)
             raise
 
     # ── Cleanup ───────────────────────────────────────────────────────
 
-    async def _cleanup_stale(self) -> None:
-        """Remove stale VMs (cost control + orphan recovery)."""
-        # Clean up warm VMs older than max_age_hours
+    async def _cleanup_stale_warm_vms(self):
+        """Clean up warm VMs older than max_age_hours."""
         async with self._db.execute("""
             SELECT id, instance_hash FROM vm_pool
             WHERE status = 'warm'
             AND datetime(created_at) < datetime('now', ?, 'utc')
         """, (f'-{self.max_age_hours} hours',)) as cursor:
-            rows = await cursor.fetchall()
+            stale_vms = await cursor.fetchall()
 
-        for row in rows:
+        for row in stale_vms:
             logger.info(f"Cleaning up stale warm VM {row['instance_hash'][:12]}...")
             await self.remove(row["id"], destroy_vm=True)
 
+    async def _cleanup_failed_and_stuck_entries(self):
+        """Clean up failed provisions and stuck entries."""
         # Clean up failed provisions (1 hour)
         await self._db.execute("""
             DELETE FROM vm_pool
@@ -368,7 +397,8 @@ class VMPool:
             AND datetime(created_at) < datetime('now', '-30 minutes', 'utc')
         """)
 
-        # Clean up orphaned 'claimed' entries (stuck for >10 min = deployment abandoned)
+    async def _cleanup_orphaned_claimed_vms(self):
+        """Clean up orphaned 'claimed' entries."""
         async with self._db.execute("""
             SELECT id, instance_hash FROM vm_pool
             WHERE status = 'claimed'
@@ -380,4 +410,9 @@ class VMPool:
             logger.warning(f"Releasing orphaned claimed VM {row['instance_hash'][:12]}...")
             await self.release(row["id"])
 
+    async def _cleanup_stale(self) -> None:
+        """Remove stale VMs (cost control + orphan recovery)."""
+        await self._cleanup_stale_warm_vms()
+        await self._cleanup_failed_and_stuck_entries()
+        await self._cleanup_orphaned_claimed_vms()
         await self._db.commit()

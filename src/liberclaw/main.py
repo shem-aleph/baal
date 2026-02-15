@@ -22,6 +22,65 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _reset_stuck_agents() -> None:
+    """Reset agents stuck in deploying status from previous shutdown."""
+    from liberclaw.database.models import Agent
+
+    async with get_session_factory()() as db:
+        result = await db.execute(
+            select(Agent.id, Agent.name).where(Agent.deployment_status == "deploying")
+        )
+        stuck_agents = result.all()
+        
+        if not stuck_agents:
+            return
+
+        await db.execute(
+            update(Agent)
+            .where(Agent.deployment_status == "deploying")
+            .values(deployment_status="failed")
+        )
+        await db.commit()
+        
+        for agent_id, name in stuck_agents:
+            logger.warning(f"Reset stuck agent '{name}' ({agent_id}) from deploying → failed")
+
+
+async def _initialize_vm_pool(settings: LiberClawSettings) -> VMPool | None:
+    """Initialize VM pool if enabled, return None on failure."""
+    if not settings.pool_enabled:
+        return None
+
+    try:
+        from baal_core.deployer import AlephDeployer
+        from baal_core.pool_manager import VMPool
+
+        deployer = AlephDeployer(
+            private_key=settings.aleph_private_key,
+            ssh_pubkey=settings.aleph_ssh_pubkey,
+            ssh_privkey_path=settings.aleph_ssh_privkey_path,
+        )
+        
+        pool = VMPool(
+            db_path=settings.pool_db_path,
+            deployer=deployer,
+            min_size=settings.pool_min_size,
+            max_size=settings.pool_max_size,
+            replenish_interval=settings.pool_replenish_interval,
+            max_age_hours=settings.pool_max_age_hours,
+        )
+        
+        await pool.initialize()
+        await pool.start_replenisher()
+        
+        logger.info(f"VM pool enabled (min={settings.pool_min_size}, max={settings.pool_max_size})")
+        return pool
+        
+    except Exception as e:
+        logger.error(f"VM pool initialization failed, continuing without pool: {e}")
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
@@ -34,27 +93,20 @@ async def lifespan(app: FastAPI):
     # Store settings for auth dependencies
     set_settings(settings)
 
-    # Reset agents stuck in "deploying" (killed mid-deploy by process restart)
-    from liberclaw.database.models import Agent
+    # Reset agents stuck in "deploying" from previous shutdown
+    await _reset_stuck_agents()
 
-    async with get_session_factory()() as db:
-        result = await db.execute(
-            select(Agent.id, Agent.name).where(Agent.deployment_status == "deploying")
-        )
-        stuck = result.all()
-        if stuck:
-            await db.execute(
-                update(Agent)
-                .where(Agent.deployment_status == "deploying")
-                .values(deployment_status="failed")
-            )
-            await db.commit()
-            for agent_id, name in stuck:
-                logger.warning(f"Reset stuck agent '{name}' ({agent_id}) from deploying → failed")
+    # Initialize VM pool for instant agent deployment
+    app.state.vm_pool = await _initialize_vm_pool(settings)
 
     yield
 
     # Shutdown
+    pool = getattr(app.state, "vm_pool", None)
+    if pool:
+        await pool.close()
+        logger.info("VM pool closed")
+        
     await close_engine()
     logger.info("Database engine closed")
 

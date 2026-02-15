@@ -94,6 +94,8 @@ class LiberClawSettings(BaseSettings):
         if tier == "guest":
             return self.guest_max_agents
         return self.free_max_agents
+
+    # Model defaults
     default_model: str = "qwen3-coder-next"
 
     # VM Pool
