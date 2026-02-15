@@ -20,6 +20,8 @@ from liberclaw.schemas.agents import (
     AgentListResponse,
     AgentResponse,
     AgentUpdate,
+    BulkDeleteRequest,
+    BulkDeleteResponse,
     DeploymentLogEntry,
     DeploymentStatusResponse,
     DeploymentStepResponse,
@@ -199,6 +201,44 @@ async def create_user_agent(
     )
 
     return AgentResponse.model_validate(agent)
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResponse)
+async def bulk_delete_agents(
+    body: BulkDeleteRequest,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete multiple agents at once. Returns which were deleted and which were not found."""
+    settings = get_settings()
+    deployer = _create_deployer(settings)
+    vm_pool = getattr(request.app.state, "vm_pool", None)
+
+    deleted = []
+    not_found = []
+
+    for agent_id in body.agent_ids:
+        agent = await get_agent(db, agent_id, user.id)
+        if not agent:
+            not_found.append(agent_id)
+            continue
+
+        agent_name = agent.name
+        await emit_activity(
+            db, "agent_deleted",
+            user_id=user.id,
+            metadata={"agent_name": agent_name, "bulk": True},
+            is_public=True,
+        )
+        await delete_agent(db, agent, deployer, vm_pool=vm_pool)
+        deleted.append(agent_id)
+
+    return BulkDeleteResponse(
+        deleted=deleted,
+        not_found=not_found,
+        total_deleted=len(deleted),
+    )
 
 
 @router.get("/{agent_id}", response_model=AgentResponse)

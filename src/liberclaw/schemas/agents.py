@@ -114,6 +114,18 @@ class AgentHealthResponse(BaseModel):
     current_version: int | None = None
 
 
+class BulkDeleteRequest(BaseModel):
+    """Request to delete multiple agents at once."""
+    agent_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=50)
+
+
+class BulkDeleteResponse(BaseModel):
+    """Response for bulk delete operation."""
+    deleted: list[uuid.UUID]
+    not_found: list[uuid.UUID]
+    total_deleted: int
+
+
 class AgentExport(BaseModel):
     """Portable agent configuration for import/export."""
     name: str

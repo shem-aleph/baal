@@ -326,7 +326,7 @@ class TestDownloadAgentFile:
         import httpx
         import unittest.mock as mock
 
-        from baal.services.proxy import download_agent_file
+        from baal_core.proxy import download_agent_file
 
         # Mock httpx response
         mock_resp = mock.MagicMock()
@@ -341,7 +341,7 @@ class TestDownloadAgentFile:
         mock_client.__aenter__ = mock.AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = mock.AsyncMock(return_value=None)
 
-        with mock.patch("baal.services.proxy.httpx.AsyncClient", return_value=mock_client):
+        with mock.patch("baal_core.proxy.httpx.AsyncClient", return_value=mock_client):
             result = await download_agent_file("http://localhost:8080", "token", "photo.png")
 
         assert result is not None
@@ -354,7 +354,7 @@ class TestDownloadAgentFile:
         """Test that .txt files are not detected as photos."""
         import unittest.mock as mock
 
-        from baal.services.proxy import download_agent_file
+        from baal_core.proxy import download_agent_file
 
         mock_resp = mock.MagicMock()
         mock_resp.content = b"hello text"
@@ -368,7 +368,7 @@ class TestDownloadAgentFile:
         mock_client.__aenter__ = mock.AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = mock.AsyncMock(return_value=None)
 
-        with mock.patch("baal.services.proxy.httpx.AsyncClient", return_value=mock_client):
+        with mock.patch("baal_core.proxy.httpx.AsyncClient", return_value=mock_client):
             result = await download_agent_file("http://localhost:8080", "token", "doc.txt")
 
         assert result is not None
@@ -381,7 +381,7 @@ class TestDownloadAgentFile:
         """Test filename extraction from nested paths."""
         import unittest.mock as mock
 
-        from baal.services.proxy import download_agent_file
+        from baal_core.proxy import download_agent_file
 
         mock_resp = mock.MagicMock()
         mock_resp.content = b"data"
@@ -395,7 +395,7 @@ class TestDownloadAgentFile:
         mock_client.__aenter__ = mock.AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = mock.AsyncMock(return_value=None)
 
-        with mock.patch("baal.services.proxy.httpx.AsyncClient", return_value=mock_client):
+        with mock.patch("baal_core.proxy.httpx.AsyncClient", return_value=mock_client):
             result = await download_agent_file(
                 "http://localhost:8080", "token", "sub/dir/file.pdf"
             )
@@ -410,14 +410,14 @@ class TestDownloadAgentFile:
         """Test that connection errors return None."""
         import unittest.mock as mock
 
-        from baal.services.proxy import download_agent_file
+        from baal_core.proxy import download_agent_file
 
         mock_client = mock.AsyncMock()
         mock_client.get = mock.AsyncMock(side_effect=Exception("connection refused"))
         mock_client.__aenter__ = mock.AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = mock.AsyncMock(return_value=None)
 
-        with mock.patch("baal.services.proxy.httpx.AsyncClient", return_value=mock_client):
+        with mock.patch("baal_core.proxy.httpx.AsyncClient", return_value=mock_client):
             result = await download_agent_file("http://localhost:8080", "token", "file.txt")
 
         assert result is None

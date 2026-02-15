@@ -13,6 +13,7 @@ from sqlalchemy import select, update
 from liberclaw.auth.dependencies import set_settings
 from liberclaw.config import LiberClawSettings
 from liberclaw.database.session import close_engine, get_session_factory, init_engine
+from liberclaw.errors import register_error_handlers
 from liberclaw.routers import activity, agents, auth, chat, files, health, network, templates, usage, users
 
 logging.basicConfig(
@@ -132,6 +133,9 @@ def create_app(settings: LiberClawSettings | None = None) -> FastAPI:
 
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+    # Standardized error responses
+    register_error_handlers(app)
 
     # CORS
     app.add_middleware(

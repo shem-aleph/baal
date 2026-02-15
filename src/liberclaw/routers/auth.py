@@ -159,6 +159,60 @@ async def _link_oauth(
     return user
 
 
+async def _upgrade_guest_with_oauth(
+    db: AsyncSession,
+    current_user: User,
+    provider: str,
+    provider_id: str,
+    email: str | None,
+    display_name: str | None = None,
+    avatar_url: str | None = None,
+) -> User:
+    """Upgrade a guest user by linking an OAuth provider account.
+
+    Checks for email/provider conflicts, creates the OAuthConnection,
+    and promotes the user from guest to free tier.
+
+    Raises HTTPException on conflicts.
+    """
+    if email:
+        result = await db.execute(select(User).where(User.email == email))
+        existing = result.scalar_one_or_none()
+        if existing and existing.id != current_user.id:
+            raise HTTPException(status_code=409, detail="Email already linked to another account")
+
+    # Check if this provider account is already linked
+    result = await db.execute(
+        select(OAuthConnection).where(
+            OAuthConnection.provider == provider,
+            OAuthConnection.provider_id == provider_id,
+        )
+    )
+    if result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=409,
+            detail=f"{provider.capitalize()} account already linked to another user",
+        )
+
+    conn = OAuthConnection(
+        user_id=current_user.id,
+        provider=provider,
+        provider_id=provider_id,
+        provider_email=email,
+    )
+    db.add(conn)
+    current_user.tier = "free"
+    if email and not current_user.email:
+        current_user.email = email
+        current_user.email_verified = True
+    if not current_user.display_name and display_name:
+        current_user.display_name = display_name
+    if not current_user.avatar_url and avatar_url:
+        current_user.avatar_url = avatar_url
+    await db.flush()
+    return current_user
+
+
 # ── Magic Link ─────────────────────────────────────────────────────────
 
 
@@ -274,24 +328,77 @@ async def refresh_tokens(
     return await _create_session_and_tokens(db, user, device_info)
 
 
+# ── OAuth — Common Helper ──────────────────────────────────────────────
+
+# Provider configurations for OAuth redirect/callback flow
+_OAUTH_PROVIDERS = {
+    "google": {
+        "client_id_attr": "google_client_id",
+        "client_secret_attr": "google_client_secret",
+        "create_client": create_google_client,
+        "get_user_info": get_google_user_info,
+        "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_url": "https://oauth2.googleapis.com/token",
+        "token_kwargs": {},
+    },
+    "github": {
+        "client_id_attr": "github_client_id",
+        "client_secret_attr": "github_client_secret",
+        "create_client": create_github_client,
+        "get_user_info": get_github_user_info,
+        "auth_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "token_kwargs": {"headers": {"Accept": "application/json"}},
+    },
+}
+
+
+def _oauth_redirect(provider: str):
+    """Create OAuth redirect to provider consent screen."""
+    cfg = _OAUTH_PROVIDERS[provider]
+    settings = get_settings()
+    client_id = getattr(settings, cfg["client_id_attr"])
+    if not client_id:
+        raise HTTPException(status_code=501, detail=f"{provider.title()} OAuth not configured")
+
+    redirect_uri = f"{settings.api_url}/api/v1/auth/oauth/{provider}/callback"
+    client = cfg["create_client"](
+        client_id, getattr(settings, cfg["client_secret_attr"]), redirect_uri
+    )
+    uri, _ = client.create_authorization_url(cfg["auth_url"])
+    return RedirectResponse(url=uri)
+
+
+async def _oauth_callback(provider: str, code: str, request: Request, db: AsyncSession):
+    """Exchange OAuth auth code for JWT pair and redirect to frontend."""
+    cfg = _OAUTH_PROVIDERS[provider]
+    settings = get_settings()
+    redirect_uri = f"{settings.api_url}/api/v1/auth/oauth/{provider}/callback"
+    client = cfg["create_client"](
+        getattr(settings, cfg["client_id_attr"]),
+        getattr(settings, cfg["client_secret_attr"]),
+        redirect_uri,
+    )
+
+    await client.fetch_token(url=cfg["token_url"], code=code, **cfg["token_kwargs"])
+    user_info = await cfg["get_user_info"](client)
+    user = await _link_oauth(db, user_info)
+
+    device_info = request.headers.get("user-agent", "")[:500]
+    tokens = await _create_session_and_tokens(db, user, device_info, login_method=provider)
+
+    return RedirectResponse(
+        url=f"{settings.frontend_url}/auth/callback?access_token={tokens.access_token}&refresh_token={tokens.refresh_token}"
+    )
+
+
 # ── OAuth — Google ─────────────────────────────────────────────────────
 
 
 @router.get("/oauth/google")
 async def oauth_google_redirect():
     """Redirect to Google consent screen."""
-    settings = get_settings()
-    if not settings.google_client_id:
-        raise HTTPException(status_code=501, detail="Google OAuth not configured")
-
-    redirect_uri = f"{settings.api_url}/api/v1/auth/oauth/google/callback"
-    client = create_google_client(
-        settings.google_client_id, settings.google_client_secret, redirect_uri
-    )
-    uri, _ = client.create_authorization_url(
-        "https://accounts.google.com/o/oauth2/v2/auth"
-    )
-    return RedirectResponse(url=uri)
+    return _oauth_redirect("google")
 
 
 @router.get("/oauth/google/callback")
@@ -301,25 +408,7 @@ async def oauth_google_callback(
     db: AsyncSession = Depends(get_db),
 ):
     """Exchange Google auth code for JWT pair."""
-    settings = get_settings()
-    redirect_uri = f"{settings.api_url}/api/v1/auth/oauth/google/callback"
-    client = create_google_client(
-        settings.google_client_id, settings.google_client_secret, redirect_uri
-    )
-
-    await client.fetch_token(
-        url="https://oauth2.googleapis.com/token", code=code
-    )
-    user_info = await get_google_user_info(client)
-    user = await _link_oauth(db, user_info)
-
-    device_info = request.headers.get("user-agent", "")[:500]
-    tokens = await _create_session_and_tokens(db, user, device_info, login_method="google")
-
-    # Redirect to frontend with tokens
-    return RedirectResponse(
-        url=f"{settings.frontend_url}/auth/callback?access_token={tokens.access_token}&refresh_token={tokens.refresh_token}"
-    )
+    return await _oauth_callback("google", code, request, db)
 
 
 # ── OAuth — GitHub ─────────────────────────────────────────────────────
@@ -328,18 +417,7 @@ async def oauth_google_callback(
 @router.get("/oauth/github")
 async def oauth_github_redirect():
     """Redirect to GitHub auth screen."""
-    settings = get_settings()
-    if not settings.github_client_id:
-        raise HTTPException(status_code=501, detail="GitHub OAuth not configured")
-
-    redirect_uri = f"{settings.api_url}/api/v1/auth/oauth/github/callback"
-    client = create_github_client(
-        settings.github_client_id, settings.github_client_secret, redirect_uri
-    )
-    uri, _ = client.create_authorization_url(
-        "https://github.com/login/oauth/authorize"
-    )
-    return RedirectResponse(url=uri)
+    return _oauth_redirect("github")
 
 
 @router.get("/oauth/github/callback")
@@ -349,26 +427,7 @@ async def oauth_github_callback(
     db: AsyncSession = Depends(get_db),
 ):
     """Exchange GitHub auth code for JWT pair."""
-    settings = get_settings()
-    redirect_uri = f"{settings.api_url}/api/v1/auth/oauth/github/callback"
-    client = create_github_client(
-        settings.github_client_id, settings.github_client_secret, redirect_uri
-    )
-
-    await client.fetch_token(
-        url="https://github.com/login/oauth/access_token",
-        code=code,
-        headers={"Accept": "application/json"},
-    )
-    user_info = await get_github_user_info(client)
-    user = await _link_oauth(db, user_info)
-
-    device_info = request.headers.get("user-agent", "")[:500]
-    tokens = await _create_session_and_tokens(db, user, device_info, login_method="github")
-
-    return RedirectResponse(
-        url=f"{settings.frontend_url}/auth/callback?access_token={tokens.access_token}&refresh_token={tokens.refresh_token}"
-    )
+    return await _oauth_callback("github", code, request, db)
 
 
 # ── Wallet Auth ────────────────────────────────────────────────────────
@@ -427,7 +486,7 @@ async def wallet_verify(
 
 
 @router.post("/guest", response_model=TokenPair)
-@limiter.limit("10/minute")
+@limiter.limit("120/minute")
 async def guest_login(
     body: GuestRequest,
     request: Request,
@@ -486,40 +545,16 @@ async def mobile_google_login(
 
     # If a guest user is upgrading, attach OAuth to their account
     if current_user and current_user.tier == "guest":
-        result = await db.execute(select(User).where(User.email == email))
-        existing = result.scalar_one_or_none()
-        if existing and existing.id != current_user.id:
-            raise HTTPException(status_code=409, detail="Email already linked to another account")
-
-        # Check if this Google account is already linked to someone
-        result = await db.execute(
-            select(OAuthConnection).where(
-                OAuthConnection.provider == "google",
-                OAuthConnection.provider_id == claims["sub"],
-            )
-        )
-        if result.scalar_one_or_none():
-            raise HTTPException(status_code=409, detail="Google account already linked to another user")
-
-        conn = OAuthConnection(
-            user_id=current_user.id,
+        user = await _upgrade_guest_with_oauth(
+            db, current_user,
             provider="google",
             provider_id=claims["sub"],
-            provider_email=email,
+            email=email,
+            display_name=claims.get("name"),
+            avatar_url=claims.get("picture"),
         )
-        db.add(conn)
-        current_user.tier = "free"
-        if not current_user.email:
-            current_user.email = email
-            current_user.email_verified = True
-        if not current_user.display_name:
-            current_user.display_name = claims.get("name")
-        if not current_user.avatar_url:
-            current_user.avatar_url = claims.get("picture")
-        await db.flush()
-
         device_info = request.headers.get("user-agent", "")[:500]
-        return await _create_session_and_tokens(db, current_user, device_info, login_method="google")
+        return await _create_session_and_tokens(db, user, device_info, login_method="google")
 
     # Normal flow — find or create user via OAuth
     user_info = {
@@ -558,39 +593,15 @@ async def mobile_apple_login(
 
     # If a guest user is upgrading, attach OAuth to their account
     if current_user and current_user.tier == "guest":
-        if email:
-            result = await db.execute(select(User).where(User.email == email))
-            existing = result.scalar_one_or_none()
-            if existing and existing.id != current_user.id:
-                raise HTTPException(status_code=409, detail="Email already linked to another account")
-
-        # Check if this Apple account is already linked to someone
-        result = await db.execute(
-            select(OAuthConnection).where(
-                OAuthConnection.provider == "apple",
-                OAuthConnection.provider_id == apple_sub,
-            )
-        )
-        if result.scalar_one_or_none():
-            raise HTTPException(status_code=409, detail="Apple account already linked to another user")
-
-        conn = OAuthConnection(
-            user_id=current_user.id,
+        user = await _upgrade_guest_with_oauth(
+            db, current_user,
             provider="apple",
             provider_id=apple_sub,
-            provider_email=email,
+            email=email,
+            display_name=body.full_name,
         )
-        db.add(conn)
-        current_user.tier = "free"
-        if email and not current_user.email:
-            current_user.email = email
-            current_user.email_verified = True
-        if not current_user.display_name and body.full_name:
-            current_user.display_name = body.full_name
-        await db.flush()
-
         device_info = request.headers.get("user-agent", "")[:500]
-        return await _create_session_and_tokens(db, current_user, device_info, login_method="apple")
+        return await _create_session_and_tokens(db, user, device_info, login_method="apple")
 
     # Normal flow — find or create user via OAuth
     user_info = {
