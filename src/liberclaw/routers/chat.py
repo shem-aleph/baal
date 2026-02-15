@@ -17,7 +17,7 @@ from liberclaw.schemas.chat import ChatMessageRequest
 from liberclaw.services.activity import emit_activity
 from liberclaw.services.agent_manager import get_agent
 from liberclaw.services.chat_proxy import proxy_chat_stream
-from liberclaw.services.usage_tracker import check_and_increment
+from liberclaw.services.usage_tracker import check_and_increment, record_event
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -46,6 +46,9 @@ async def send_message(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Daily message limit reached",
         )
+
+    # Record per-agent usage event for analytics
+    await record_event(db, user.id, "chat_message", agent_id=agent.id)
 
     await emit_activity(
         db, "chat_message",

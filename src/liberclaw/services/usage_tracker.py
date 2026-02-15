@@ -90,3 +90,75 @@ async def get_usage_history(
     )
     rows = result.scalars().all()
     return [{"date": r.date, "message_count": r.message_count} for r in rows]
+
+
+async def get_per_agent_usage(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    days: int = 30,
+) -> list[dict]:
+    """Get per-agent message counts for the last N days.
+
+    Groups UsageEvent rows by agent_id and returns counts + totals.
+    """
+    from datetime import timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    result = await db.execute(
+        select(
+            UsageEvent.agent_id,
+            Agent.name.label("agent_name"),
+            func.count(UsageEvent.id).label("message_count"),
+            func.coalesce(func.sum(UsageEvent.tokens_used), 0).label("total_tokens"),
+        )
+        .outerjoin(Agent, UsageEvent.agent_id == Agent.id)
+        .where(
+            UsageEvent.user_id == user_id,
+            UsageEvent.event_type == "chat_message",
+            UsageEvent.created_at >= cutoff,
+        )
+        .group_by(UsageEvent.agent_id, Agent.name)
+        .order_by(func.count(UsageEvent.id).desc())
+    )
+    rows = result.all()
+    return [
+        {
+            "agent_id": str(r.agent_id) if r.agent_id else None,
+            "agent_name": r.agent_name or "Unknown",
+            "message_count": r.message_count,
+            "total_tokens": r.total_tokens,
+        }
+        for r in rows
+    ]
+
+
+async def get_per_agent_usage(
+    db: AsyncSession, user_id: uuid.UUID
+) -> list[dict]:
+    """Get total message counts per agent for the current user."""
+    result = await db.execute(
+        select(
+            UsageEvent.agent_id,
+            Agent.name,
+            func.count(UsageEvent.id).label("message_count"),
+            func.sum(UsageEvent.tokens_used).label("total_tokens"),
+        )
+        .join(Agent, Agent.id == UsageEvent.agent_id, isouter=True)
+        .where(
+            UsageEvent.user_id == user_id,
+            UsageEvent.agent_id.isnot(None),
+        )
+        .group_by(UsageEvent.agent_id, Agent.name)
+        .order_by(func.count(UsageEvent.id).desc())
+    )
+    rows = result.all()
+    return [
+        {
+            "agent_id": str(row.agent_id),
+            "agent_name": row.name,
+            "message_count": row.message_count,
+            "total_tokens": row.total_tokens or 0,
+        }
+        for row in rows
+    ]

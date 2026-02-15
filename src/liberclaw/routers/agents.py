@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+import json
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from baal_core.encryption import decrypt
@@ -384,6 +387,63 @@ async def get_deployment_status(
         vm_url=agent.vm_url,
         steps=steps,
         logs=logs,
+    )
+
+
+@router.get("/{agent_id}/deploy/stream")
+async def stream_deployment_status(
+    agent_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """SSE stream of deployment progress updates.
+
+    Uses event-driven broadcasting — no polling.  Sends the current snapshot
+    immediately, then streams step/log/complete events as they happen.
+    Falls back to a ``complete`` event if no deployment is in progress.
+    """
+    from liberclaw.services.deployment_progress import (
+        deployment_broadcaster,
+        get_progress,
+    )
+
+    agent = await get_agent(db, agent_id, user.id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    async def event_generator():
+        try:
+            # Send current snapshot first so the client has immediate state
+            progress = get_progress(agent_id)
+            if progress:
+                steps_data = [s.to_dict() for s in progress.steps]
+                yield f"data: {json.dumps({'type': 'snapshot', 'steps': steps_data})}\n\n"
+                for log in progress.logs:
+                    yield f"data: {json.dumps({'type': 'log', **log.to_dict()})}\n\n"
+            else:
+                # No active deployment — send final status and close
+                async with get_session_factory()() as fresh_db:
+                    agent_fresh = await get_agent(fresh_db, agent_id, user.id)
+                    status_val = agent_fresh.deployment_status if agent_fresh else "unknown"
+                yield f"data: {json.dumps({'type': 'complete', 'deployment_status': status_val})}\n\n"
+                return
+
+            # Stream real-time updates via the broadcaster
+            async for event in deployment_broadcaster.subscribe(agent_id):
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") == "complete":
+                    return
+        except asyncio.CancelledError:
+            return
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

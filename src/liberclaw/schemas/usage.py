@@ -22,3 +22,15 @@ class UsageDay(BaseModel):
 
 class UsageHistory(BaseModel):
     days: list[UsageDay]
+
+
+class AgentUsage(BaseModel):
+    agent_id: str | None
+    agent_name: str
+    message_count: int
+    total_tokens: int
+
+
+class AgentUsageResponse(BaseModel):
+    agents: list[AgentUsage]
+    period_days: int
