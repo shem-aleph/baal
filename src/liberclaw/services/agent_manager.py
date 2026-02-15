@@ -9,7 +9,9 @@ import secrets
 import time
 import uuid
 
+import sqlalchemy as sa
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from baal_core.deployer import AlephDeployer
@@ -55,21 +57,55 @@ async def create_agent(
         auth_token=encrypted_secret,
         deployment_status="pending",
         source="web",
-        skills=json.dumps(skills) if skills else None,
+        skills=skills,  # Now stored as native JSON, not string
     )
     db.add(agent)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as e:
+        if "uq_agents_owner_id_name" in str(e):
+            raise ValueError(f"Agent name '{name}' already exists") from e
+        raise
     return agent
 
 
-async def list_agents(db: AsyncSession, owner_id: uuid.UUID) -> list[Agent]:
-    """List all agents for a user."""
-    result = await db.execute(
-        select(Agent)
-        .where(Agent.owner_id == owner_id)
-        .order_by(Agent.created_at.desc())
-    )
-    return list(result.scalars().all())
+async def list_agents(
+    db: AsyncSession, 
+    owner_id: uuid.UUID,
+    limit: int = 20,
+    offset: int = 0,
+    status: str | None = None,
+    sort: str = "created_at",
+    order: str = "desc"
+) -> tuple[list[Agent], int]:
+    """List agents for a user with pagination, filtering, and sorting."""
+    # Build base query
+    query = select(Agent).where(Agent.owner_id == owner_id)
+    
+    # Add status filter if provided
+    if status:
+        query = query.where(Agent.deployment_status == status)
+    
+    # Add sorting
+    sort_column = getattr(Agent, sort, Agent.created_at)
+    if order.lower() == "asc":
+        query = query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc())
+    
+    # Get total count for pagination info
+    count_query = select(sa.func.count()).select_from(query.subquery())
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
+    
+    # Apply pagination
+    query = query.limit(limit).offset(offset)
+    
+    # Execute query
+    result = await db.execute(query)
+    agents = list(result.scalars().all())
+    
+    return agents, total
 
 
 async def get_agent(
@@ -100,7 +136,7 @@ async def update_agent(
             raise ValueError(f"Unknown model: {model}")
         agent.model = model
     if skills is not None:
-        agent.skills = json.dumps(skills) if skills else None
+        agent.skills = skills  # Now stored as native JSON, not string
     await db.flush()
     return agent
 
@@ -146,7 +182,7 @@ async def _deploy_to_pooled_vm(
     pooled_vm, agent, deployer, libertai_api_key, agent_secret, subdomain
 ):
     """Deploy agent code to the pooled VM."""
-    agent_skills = json.loads(agent.skills) if agent.skills else None
+    agent_skills = agent.skills  # Now native JSON
     fqdn = f"{subdomain}.2n6.me"
 
     return await deployer.deploy_agent_code(
@@ -482,8 +518,8 @@ async def deploy_agent_background(
             # The deployer calls on_deploy_progress for sub-step updates
             add_log(agent_id, "info", "Starting agent deployment...")
 
-            # Parse skills from agent record
-            agent_skills = json.loads(agent.skills) if agent.skills else None
+            # Get skills from agent record (now native JSON)
+            agent_skills = agent.skills
 
             deploy_result = await deployer.deploy_agent(
                 vm_ip=vm_ip,
@@ -587,7 +623,7 @@ async def redeploy_agent_background(
 
         try:
             agent_secret = decrypt(agent.auth_token, encryption_key)
-            agent_skills = json.loads(agent.skills) if agent.skills else None
+            agent_skills = agent.skills  # Now native JSON
             fqdn = agent.vm_url.replace("https://", "").replace("http://", "")
 
             # ── Step 1: Find existing VM ─────────────────────────────────

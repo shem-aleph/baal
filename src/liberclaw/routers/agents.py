@@ -57,14 +57,36 @@ async def get_pool_stats(
 
 @router.get("/", response_model=AgentListResponse)
 async def list_user_agents(
+    limit: int = 20,
+    offset: int = 0,
+    status: str | None = None,
+    sort: str = "created_at", 
+    order: str = "desc",
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all agents owned by the current user."""
-    agents = await list_agents(db, user.id)
+    """List agents owned by the current user with pagination, filtering, and sorting."""
+    # Validate parameters
+    limit = min(max(1, limit), 100)  # Clamp between 1 and 100
+    offset = max(0, offset)
+    
+    valid_sorts = ["created_at", "name", "updated_at"]
+    if sort not in valid_sorts:
+        sort = "created_at"
+    
+    if order.lower() not in ["asc", "desc"]:
+        order = "desc"
+        
+    agents, total = await list_agents(
+        db, user.id, limit=limit, offset=offset, 
+        status=status, sort=sort, order=order
+    )
+    
     return AgentListResponse(
         agents=[AgentResponse.model_validate(a) for a in agents],
-        total=len(agents),
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 
@@ -146,10 +168,15 @@ async def create_user_agent(
     _validate_skills(skills)
 
     # Create agent and emit activity
-    agent = await create_agent(
-        db, user.id, body.name, system_prompt, model,
-        settings.encryption_key, skills=skills,
-    )
+    try:
+        agent = await create_agent(
+            db, user.id, body.name, system_prompt, model,
+            settings.encryption_key, skills=skills,
+        )
+    except ValueError as e:
+        if "already exists" in str(e):
+            raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
     await emit_activity(
         db, "agent_created",
         user_id=user.id, agent_id=agent.id,

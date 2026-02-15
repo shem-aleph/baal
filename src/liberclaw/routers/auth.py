@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from liberclaw.rate_limit import limiter
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -162,7 +163,9 @@ async def _link_oauth(
 
 
 @router.post("/login/email", response_model=MagicLinkResponse)
+@limiter.limit("5/minute")
 async def request_magic_link(
+    request: Request,
     body: MagicLinkRequest,
     db: AsyncSession = Depends(get_db),
 ):
@@ -189,6 +192,7 @@ async def request_magic_link(
 
 
 @router.post("/verify-magic-link", response_model=TokenPair)
+@limiter.limit("10/minute")
 async def verify_magic_link(
     body: MagicLinkVerifyRequest,
     request: Request,
@@ -371,7 +375,9 @@ async def oauth_github_callback(
 
 
 @router.post("/wallet/challenge", response_model=WalletChallengeResponse)
+@limiter.limit("10/minute")
 async def wallet_challenge(
+    request: Request,
     body: WalletChallengeRequest,
     db: AsyncSession = Depends(get_db),
 ):
@@ -421,6 +427,7 @@ async def wallet_verify(
 
 
 @router.post("/guest", response_model=TokenPair)
+@limiter.limit("10/minute")
 async def guest_login(
     body: GuestRequest,
     request: Request,

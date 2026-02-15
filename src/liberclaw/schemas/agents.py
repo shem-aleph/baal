@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 
@@ -10,17 +11,55 @@ from pydantic import BaseModel, Field, field_validator
 
 class AgentCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    system_prompt: str | None = Field(None, min_length=1)
+    system_prompt: str | None = Field(None, min_length=1, max_length=10000)
     model: str | None = None
     template_id: str | None = None
     skills: list[str] | None = None
+    
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        if not re.match(r"^[a-zA-Z0-9\s\-_]+$", v):
+            raise ValueError("Name must contain only alphanumeric characters, spaces, hyphens, and underscores")
+        return v
+    
+    @field_validator("model")
+    @classmethod 
+    def validate_model(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        from baal_core.models import AVAILABLE_MODELS
+        if v not in AVAILABLE_MODELS:
+            valid_models = ", ".join(AVAILABLE_MODELS.keys())
+            raise ValueError(f"Model must be one of: {valid_models}")
+        return v
 
 
 class AgentUpdate(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=100)
-    system_prompt: str | None = Field(None, min_length=1)
+    system_prompt: str | None = Field(None, min_length=1, max_length=10000)
     model: str | None = None
     skills: list[str] | None = None
+    
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not re.match(r"^[a-zA-Z0-9\s\-_]+$", v):
+            raise ValueError("Name must contain only alphanumeric characters, spaces, hyphens, and underscores")
+        return v
+    
+    @field_validator("model")
+    @classmethod 
+    def validate_model(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        from baal_core.models import AVAILABLE_MODELS
+        if v not in AVAILABLE_MODELS:
+            valid_models = ", ".join(AVAILABLE_MODELS.keys())
+            raise ValueError(f"Model must be one of: {valid_models}")
+        return v
 
 
 class AgentResponse(BaseModel):
@@ -35,14 +74,7 @@ class AgentResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-    @field_validator("skills", mode="before")
-    @classmethod
-    def parse_skills(cls, v):
-        if isinstance(v, str):
-            import json
-
-            return json.loads(v)
-        return v
+    # Skills is now stored as native JSON, no parsing needed
 
     model_config = {"from_attributes": True}
 
@@ -50,6 +82,8 @@ class AgentResponse(BaseModel):
 class AgentListResponse(BaseModel):
     agents: list[AgentResponse]
     total: int
+    limit: int
+    offset: int
 
 
 class DeploymentStepResponse(BaseModel):
