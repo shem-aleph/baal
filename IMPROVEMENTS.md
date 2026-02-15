@@ -20,16 +20,16 @@ Prioritized by: impact × feasibility (can implement and test locally tonight)
 - [ ] **Secret validation** — Validate required secrets on startup (config.py)
 
 ### Round 3: Code Quality & Testing
-- [ ] **OAuth dedup** — Extract common OAuth provider logic (QUAL-004)
-- [ ] **API test suite** — Integration tests for auth, agents, chat endpoints (TEST-001)
-- [ ] **Error response standardization** — Consistent error format (API-001)
-- [ ] **Migration rollbacks** — Add downgrade() to all migrations (DB-005)
+- [x] **OAuth dedup** — Extract common OAuth provider logic (QUAL-004)
+- [x] **API test suite** — Integration tests for auth, agents, chat endpoints (TEST-001)
+- [x] **Error response standardization** — Consistent error format (API-001)
+- [x] **Migration rollbacks** — Add downgrade() to all migrations (DB-005) *(already done)*
 
 ### Round 4: Features
 - [ ] **Agent status websocket/SSE** — Real-time deployment updates
 - [ ] **Usage tracking improvements** — Per-agent message counts
-- [ ] **Agent export/import** — JSON export of agent configs
-- [ ] **Bulk operations** — Delete multiple agents
+- [x] **Agent export/import** — JSON export of agent configs
+- [x] **Bulk operations** — Delete multiple agents
 
 ### Deferred (needs arch decisions / too risky for overnight)
 - SEC-001: Command injection in agent tools (needs sandbox redesign)
@@ -42,5 +42,20 @@ Prioritized by: impact × feasibility (can implement and test locally tonight)
 
 ## Progress Log
 
-### Round 1 — Starting
-_Last updated: 2026-02-15T02:05Z_
+### Round 1+2 — Complete
+_Completed: 2026-02-15T02:30Z_
+DB indexes, validation, pagination, rate limiting, health checks, secret validation.
+
+### Round 3 — Complete
+_Completed: 2026-02-15T09:35Z_
+- OAuth dedup: extracted `_oauth_redirect`/`_oauth_callback` helpers, reducing ~90 lines of duplication
+- Error standardization: all errors now return `{error: {code, message, status, details}}`
+- Test fixes: fixed mock paths, status filter, duplicate name test, trailing slash redirect
+- Migration rollbacks: all 6 migrations already had downgrade() functions
+- 87 tests passing (81 original + 6 new)
+
+### Round 4 — In Progress
+_Last updated: 2026-02-15T09:35Z_
+- Agent export/import: done (previous commit)
+- Bulk delete: POST /agents/bulk-delete with partial success reporting
+- Remaining: agent status websocket/SSE, usage tracking improvements
