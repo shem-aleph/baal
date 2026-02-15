@@ -132,33 +132,3 @@ async def get_per_agent_usage(
         for r in rows
     ]
 
-
-async def get_per_agent_usage(
-    db: AsyncSession, user_id: uuid.UUID
-) -> list[dict]:
-    """Get total message counts per agent for the current user."""
-    result = await db.execute(
-        select(
-            UsageEvent.agent_id,
-            Agent.name,
-            func.count(UsageEvent.id).label("message_count"),
-            func.sum(UsageEvent.tokens_used).label("total_tokens"),
-        )
-        .join(Agent, Agent.id == UsageEvent.agent_id, isouter=True)
-        .where(
-            UsageEvent.user_id == user_id,
-            UsageEvent.agent_id.isnot(None),
-        )
-        .group_by(UsageEvent.agent_id, Agent.name)
-        .order_by(func.count(UsageEvent.id).desc())
-    )
-    rows = result.all()
-    return [
-        {
-            "agent_id": str(row.agent_id),
-            "agent_name": row.name,
-            "message_count": row.message_count,
-            "total_tokens": row.total_tokens or 0,
-        }
-        for row in rows
-    ]
