@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -97,6 +97,15 @@ class LiberClawSettings(BaseSettings):
 
     # Model defaults
     default_model: str = "qwen3-coder-next"
+
+    @model_validator(mode="after")
+    def validate_required_secrets(self) -> "LiberClawSettings":
+        """Validate critical secrets are present and well-formed."""
+        if len(self.jwt_secret) < 16:
+            raise ValueError("JWT_SECRET must be at least 16 characters")
+        if len(self.encryption_key) < 20:
+            raise ValueError("ENCRYPTION_KEY must be a valid Fernet key")
+        return self
 
     # VM Pool
     pool_enabled: bool = False
