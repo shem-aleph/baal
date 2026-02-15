@@ -112,3 +112,12 @@ class AgentHealthResponse(BaseModel):
     vm_url: str | None
     agent_version: int | None = None
     current_version: int | None = None
+
+
+class AgentExport(BaseModel):
+    """Portable agent configuration for import/export."""
+    name: str
+    system_prompt: str
+    model: str
+    skills: list[str] | None = None
+    export_version: int = 1

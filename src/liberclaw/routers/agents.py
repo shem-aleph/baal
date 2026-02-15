@@ -15,6 +15,7 @@ from liberclaw.database.models import Agent, User
 from liberclaw.database.session import get_db, get_session_factory
 from liberclaw.schemas.agents import (
     AgentCreate,
+    AgentExport,
     AgentHealthResponse,
     AgentListResponse,
     AgentResponse,
@@ -441,6 +442,73 @@ async def redeploy_agent(
         libertai_api_key=settings.libertai_api_key,
         encryption_key=settings.encryption_key,
         db_factory=get_session_factory(),
+    )
+
+    return AgentResponse.model_validate(agent)
+
+
+# ── Export / Import ────────────────────────────────────────────────────
+
+
+@router.get("/{agent_id}/export", response_model=AgentExport)
+async def export_agent(
+    agent_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Export agent configuration as portable JSON."""
+    agent = await get_agent(db, agent_id, user.id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    return AgentExport(
+        name=agent.name,
+        system_prompt=agent.system_prompt,
+        model=agent.model,
+        skills=agent.skills,
+    )
+
+
+@router.post("/import", response_model=AgentResponse, status_code=201)
+async def import_agent(
+    body: AgentExport,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Import an agent from exported JSON and deploy it."""
+    settings = get_settings()
+
+    agent_limit = settings.agent_limit(user.tier)
+    count = await get_agent_count(db, user.id)
+    if count >= agent_limit:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Agent limit reached ({agent_limit})",
+        )
+
+    agent = await create_agent(
+        db, user.id, body.name, body.system_prompt, body.model,
+        settings.encryption_key, skills=body.skills,
+    )
+    await emit_activity(
+        db, "agent_imported",
+        user_id=user.id, agent_id=agent.id,
+        metadata={"agent_name": body.name},
+    )
+    await db.commit()
+
+    deployer = _create_deployer(settings)
+    vm_pool = getattr(request.app.state, "vm_pool", None)
+    background_tasks.add_task(
+        deploy_agent_background,
+        agent_id=agent.id,
+        deployer=deployer,
+        libertai_api_key=settings.libertai_api_key,
+        encryption_key=settings.encryption_key,
+        db_factory=get_session_factory(),
+        vm_pool=vm_pool,
     )
 
     return AgentResponse.model_validate(agent)
