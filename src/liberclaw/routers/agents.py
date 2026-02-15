@@ -174,15 +174,10 @@ async def create_user_agent(
     _validate_skills(skills)
 
     # Create agent and emit activity
-    try:
-        agent = await create_agent(
-            db, user.id, body.name, system_prompt, model,
-            settings.encryption_key, skills=skills,
-        )
-    except ValueError as e:
-        if "already exists" in str(e):
-            raise HTTPException(status_code=409, detail=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
+    agent = await create_agent(
+        db, user.id, body.name, system_prompt, model,
+        settings.encryption_key, skills=skills,
+    )
     await emit_activity(
         db, "agent_created",
         user_id=user.id, agent_id=agent.id,

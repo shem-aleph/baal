@@ -11,7 +11,6 @@ import uuid
 
 import sqlalchemy as sa
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from baal_core.deployer import AlephDeployer
@@ -60,12 +59,7 @@ async def create_agent(
         skills=skills,  # Now stored as native JSON, not string
     )
     db.add(agent)
-    try:
-        await db.flush()
-    except IntegrityError as e:
-        if "uq_agents_owner_id_name" in str(e):
-            raise ValueError(f"Agent name '{name}' already exists") from e
-        raise
+    await db.flush()
     return agent
 
 
