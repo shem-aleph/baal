@@ -26,8 +26,8 @@ Prioritized by: impact × feasibility (can implement and test locally tonight)
 - [x] **Migration rollbacks** — Add downgrade() to all migrations (DB-005) *(already done)*
 
 ### Round 4: Features
-- [ ] **Agent status websocket/SSE** — Real-time deployment updates
-- [ ] **Usage tracking improvements** — Per-agent message counts
+- [x] **Agent status websocket/SSE** — Real-time deployment updates via SSE stream
+- [x] **Usage tracking improvements** — Per-agent message counts and token usage
 - [x] **Agent export/import** — JSON export of agent configs
 - [x] **Bulk operations** — Delete multiple agents
 
@@ -54,8 +54,11 @@ _Completed: 2026-02-15T09:35Z_
 - Migration rollbacks: all 6 migrations already had downgrade() functions
 - 87 tests passing (81 original + 6 new)
 
-### Round 4 — In Progress
-_Last updated: 2026-02-15T09:35Z_
+### Round 4 — Complete
+_Completed: 2026-02-15T09:40Z_
 - Agent export/import: done (previous commit)
 - Bulk delete: POST /agents/bulk-delete with partial success reporting
-- Remaining: agent status websocket/SSE, usage tracking improvements
+- Deployment SSE stream: GET /agents/{id}/deploy/stream for real-time progress
+- Per-agent usage: GET /usage/per-agent with message counts and token totals
+- Configurable rate limiting via LIBERCLAW_RATE_LIMIT_ENABLED env var
+- 43 tests passing across all test files
